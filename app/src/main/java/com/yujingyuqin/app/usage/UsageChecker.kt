@@ -54,21 +54,4 @@ object UsageChecker {
         )
     }
 
-    /** 通过使用事件查询当前前台应用（API 28+；作为无障碍事件缺失时的兜底） */
-    fun currentForegroundPackage(context: Context): String? {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
-        val usm = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
-        val end = System.currentTimeMillis()
-        val start = end - 60_000L
-        val events = usm.queryEvents(start, end) ?: return null
-        val event = android.app.usage.UsageEvents.Event()
-        var foreground: String? = null
-        while (events.hasNextEvent()) {
-            events.getNextEvent(event)
-            if (event.eventType == android.app.usage.UsageEvents.Event.MOVE_TO_FOREGROUND) {
-                foreground = event.packageName
-            }
-        }
-        return foreground
-    }
 }
