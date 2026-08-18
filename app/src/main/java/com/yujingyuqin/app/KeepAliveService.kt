@@ -8,7 +8,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import androidx.core.app.NotificationCompat
 import com.yujingyuqin.app.limit.LimitDiagnostics
 
@@ -19,27 +21,49 @@ import com.yujingyuqin.app.limit.LimitDiagnostics
  */
 class KeepAliveService : Service() {
 
+    private val handler = Handler(Looper.getMainLooper())
+    private var heartbeatRunnable: Runnable? = null
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         ensureChannel()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(
-                NOTIFICATION_ID,
-                buildNotification(),
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            )
-        } else {
-            @Suppress("DEPRECATION")
-            startForeground(NOTIFICATION_ID, buildNotification())
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    buildNotification(),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                startForeground(NOTIFICATION_ID, buildNotification())
+            }
+            LimitDiagnostics.log(this, "keepalive", "保活服务已启动")
+        } catch (e: Exception) {
+            LimitDiagnostics.log(this, "keepalive", "保活服务启动失败: ${e.javaClass.simpleName}: ${e.message}")
         }
-        LimitDiagnostics.log(this, "keepalive", "保活服务已启动")
+        startHeartbeat()
         return START_STICKY
     }
 
     override fun onDestroy() {
+        heartbeatRunnable?.let { handler.removeCallbacks(it) }
+        heartbeatRunnable = null
         LimitDiagnostics.log(this, "keepalive", "保活服务被系统停止")
         super.onDestroy()
+    }
+
+    /** 心跳仅用于日志证明服务存活（无轮询检测、几乎零耗电）；被冻结时不运行，正好暴露问题 */
+    private fun startHeartbeat() {
+        heartbeatRunnable?.let { handler.removeCallbacks(it) }
+        heartbeatRunnable = object : Runnable {
+            override fun run() {
+                LimitDiagnostics.log(this@KeepAliveService, "keepalive", "心跳：保活服务仍在运行")
+                handler.postDelayed(this, HEARTBEAT_INTERVAL_MS)
+            }
+        }
+        handler.postDelayed(heartbeatRunnable!!, HEARTBEAT_INTERVAL_MS)
     }
 
     private fun ensureChannel() {
@@ -82,5 +106,6 @@ class KeepAliveService : Service() {
         private const val CHANNEL_ID = "keep_alive"
         private const val CHANNEL_NAME = "实时拦截服务"
         private const val NOTIFICATION_ID = 101
+        private const val HEARTBEAT_INTERVAL_MS = 5 * 60_000L
     }
 }

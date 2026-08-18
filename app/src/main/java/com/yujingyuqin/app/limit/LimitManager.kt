@@ -16,6 +16,7 @@ object LimitManager {
     private val handler = Handler(Looper.getMainLooper())
     private var pendingConfirm: PendingConfirm? = null
     private var pendingRunnable: Runnable? = null
+    private var visibleRetryRunnable: Runnable? = null
     private var gracePackage: String? = null
     private var graceUntilMs: Long = 0
     private val lastNotifiedAt = mutableMapOf<String, Long>()
@@ -37,9 +38,11 @@ object LimitManager {
             return
         }
 
-        // 本应用界面正显示（用户就在业精于勤里）时，任何外部应用事件都是过期/误投的，直接忽略
+        // 本应用界面正显示时：外部事件可能是"刚从本应用切走"的过渡事件
+        // （本应用 onStop 尚未执行），单次延迟重试，切走后照常处理，未切走则放弃
         if (AppForeground.visible) {
-            LimitDiagnostics.log(context, "manager", "本应用界面正显示，忽略外部事件 $packageName")
+            LimitDiagnostics.log(context, "manager", "本应用界面正显示，${VISIBLE_RETRY_MS}ms 后重试 $packageName")
+            scheduleVisibleRetry(context, packageName)
             return
         }
 
@@ -91,15 +94,14 @@ object LimitManager {
         }
 
         LimitDiagnostics.log(context, "manager", "$packageName 超限($used 分钟)，安排 ${CONFIRM_DELAY_MS}ms 后二次确认")
-        scheduleConfirm(context, limit, used, now, requireRootMatch = false)
+        scheduleConfirm(context, limit, used, now)
     }
 
     private fun scheduleConfirm(
         context: Context,
         limit: AppLimit,
         usedMinutes: Int,
-        now: Long,
-        requireRootMatch: Boolean
+        now: Long
     ) {
         pendingRunnable?.let { handler.removeCallbacks(it) }
         val pending = PendingConfirm(context.applicationContext, limit, usedMinutes, now)
@@ -107,9 +109,24 @@ object LimitManager {
         pendingRunnable = Runnable {
             pendingConfirm = null
             pendingRunnable = null
-            confirmAndBlock(pending, 0, requireRootMatch)
+            confirmAndBlock(pending)
         }
         handler.postDelayed(pendingRunnable!!, CONFIRM_DELAY_MS)
+    }
+
+    /** 本应用仍在前台时到达的外部事件：单次延迟重试（切走后补拦，未切走则放弃，非轮询） */
+    private fun scheduleVisibleRetry(context: Context, packageName: String) {
+        visibleRetryRunnable?.let { handler.removeCallbacks(it) }
+        visibleRetryRunnable = Runnable {
+            visibleRetryRunnable = null
+            if (!AppForeground.visible) {
+                LimitDiagnostics.log(context, "manager", "重试：本应用已不在前台，处理 $packageName")
+                onForegroundChanged(context, packageName)
+            } else {
+                LimitDiagnostics.log(context, "manager", "重试：本应用仍在前台，放弃 $packageName")
+            }
+        }
+        handler.postDelayed(visibleRetryRunnable!!, VISIBLE_RETRY_MS)
     }
 
     /** 取消尚未确认的拦截任务（本应用页面创建、或前台切到其他应用时调用） */
@@ -117,36 +134,20 @@ object LimitManager {
         pendingRunnable?.let { handler.removeCallbacks(it) }
         pendingRunnable = null
         pendingConfirm = null
+        visibleRetryRunnable?.let { handler.removeCallbacks(it) }
+        visibleRetryRunnable = null
     }
 
-    /**
-     * 二次确认：
-     * - 事件路径（requireRootMatch=false）：本机 rootInActiveWindow 常返回桌面/不可信，
-     *   因此只防"活动窗口是本应用自己"一种误判，其余直接信任新鲜事件，保证该弹就弹；
-     * - 兜底路径（requireRootMatch=true）：必须核对到目标应用才弹，避免把旧前台误当当前。
-     */
-    private fun confirmAndBlock(pending: PendingConfirm, attempt: Int, requireRootMatch: Boolean) {
+    /** 二次确认：本机 rootInActiveWindow 常返回桌面/不可信，只防"活动窗口是本应用自己"一种误判 */
+    private fun confirmAndBlock(pending: PendingConfirm) {
         val pkg = pending.limit.packageName
         val context = pending.context
         val active = LimitWatchService.activeWindowPackage()
-        if (requireRootMatch) {
-            if (active != null && active != pkg) {
-                LimitDiagnostics.log(context, "manager", "兜底确认失败：活动窗口=$active，目标=$pkg，放弃弹窗")
-                return
-            }
-            if (active == null && attempt < MAX_CONFIRM_RETRIES) {
-                // 窗口可能还没就绪：再确认一次
-                LimitDiagnostics.log(context, "manager", "兜底确认：活动窗口暂不可读，${ROOT_RETRY_MS}ms 后重试")
-                handler.postDelayed({ confirmAndBlock(pending, attempt + 1, true) }, ROOT_RETRY_MS)
-                return
-            }
-        } else {
-            if (active == context.packageName) {
-                LimitDiagnostics.log(context, "manager", "确认时活动窗口是本应用自己，放弃弹窗")
-                return
-            }
-            LimitDiagnostics.log(context, "manager", "事件确认 root=$active（本机 root 不可信，仅记录）")
+        if (active == context.packageName) {
+            LimitDiagnostics.log(context, "manager", "确认时活动窗口是本应用自己，放弃弹窗")
+            return
         }
+        LimitDiagnostics.log(context, "manager", "确认 root=$active（本机 root 不可信，仅记录）")
         if (AppForeground.visible) {
             LimitDiagnostics.log(context, "manager", "确认时本应用界面正显示，放弃弹窗")
             return
@@ -168,19 +169,25 @@ object LimitManager {
         showBlock(context, pending.limit, pending.usedMinutes)
     }
 
-    /** WorkManager 兜底：仅当超限应用确实是当前前台时才补发通知，不弹拦截页 */
+    /** WorkManager 兜底：最近识别的前台超限时直接弹拦截页（不再只发通知） */
     fun checkAllLimits(context: Context) {
-        // 本应用界面正显示时不兜底判定，避免使用统计延迟导致误通知
+        // 本应用界面正显示时不兜底判定
         if (AppForeground.visible) {
             LimitDiagnostics.log(context, "manager", "兜底检查：本应用正显示，跳过")
             return
         }
-        val pkg = LimitWatchService.lastForegroundPackage
-            ?: UsageChecker.currentForegroundPackage(context)
-            ?: run {
-                LimitDiagnostics.log(context, "manager", "兜底检查：无法确定当前前台，跳过")
-                return
-            }
+        val now = System.currentTimeMillis()
+        // 只信任最近 10 分钟内识别到的前台，避免用陈旧信息误弹
+        if (LimitWatchService.lastEventTimeMs <= 0L ||
+            now - LimitWatchService.lastEventTimeMs > FALLBACK_RECENCY_MS
+        ) {
+            LimitDiagnostics.log(context, "manager", "兜底检查：最近事件过旧，跳过")
+            return
+        }
+        val pkg = LimitWatchService.lastForegroundPackage ?: run {
+            LimitDiagnostics.log(context, "manager", "兜底检查：无最近前台，跳过")
+            return
+        }
         if (pkg == context.packageName) return
         val limit = LimitStore(context).load()
             .firstOrNull { it.packageName == pkg && it.enabled }
@@ -188,7 +195,6 @@ object LimitManager {
                 LimitDiagnostics.log(context, "manager", "兜底检查：$pkg 无启用限制，跳过")
                 return
             }
-        val now = System.currentTimeMillis()
         if (gracePackage == pkg && now < graceUntilMs) {
             LimitDiagnostics.log(context, "manager", "兜底检查：$pkg 处于宽限期，跳过")
             return
@@ -203,7 +209,7 @@ object LimitManager {
             return
         }
         LimitDiagnostics.log(context, "manager", "兜底检查：$pkg 超限，安排确认后弹拦截")
-        scheduleConfirm(context, limit, used, now, requireRootMatch = true)
+        scheduleConfirm(context, limit, used, now)
     }
 
     fun setGrace(packageName: String, durationMs: Long) {
@@ -234,7 +240,7 @@ object LimitManager {
 
     private const val CONFIRM_DELAY_MS = 300L
     private const val CONFIRM_TIMEOUT_MS = 1_500L
-    private const val ROOT_RETRY_MS = 200L
-    private const val MAX_CONFIRM_RETRIES = 1
+    private const val VISIBLE_RETRY_MS = 500L
+    private const val FALLBACK_RECENCY_MS = 10 * 60_000L
     private const val NOTIFY_COOLDOWN_MS = 10 * 60_000L
 }
