@@ -26,8 +26,8 @@ Android 个人侧载应用：给自己的应用使用时间设「双重关卡」
 ## 构建
 
 ```
-. D:\AndroidDev\build.ps1
-cd D:\AndroidDev\project\yujingyuqin
+. D:\DevTools\build.ps1
+cd C:\Users\Questiiing\Desktop\项目尝试\业精于勤
 gradle assembleDebug
 ```
 
