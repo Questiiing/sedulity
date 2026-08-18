@@ -33,7 +33,13 @@ class KeepAliveService : Service() {
             @Suppress("DEPRECATION")
             startForeground(NOTIFICATION_ID, buildNotification())
         }
+        LimitDiagnostics.log(this, "keepalive", "保活服务已启动")
         return START_STICKY
+    }
+
+    override fun onDestroy() {
+        LimitDiagnostics.log(this, "keepalive", "保活服务被系统停止")
+        super.onDestroy()
     }
 
     private fun ensureChannel() {

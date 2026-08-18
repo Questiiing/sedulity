@@ -33,4 +33,9 @@ class ReminderStateStore(context: Context) {
             put("completed", state.completed)
         }.toString()).apply()
     }
+
+    /** 清除某任务的今日提醒状态（修改任务后调用，保证按新时间重新提醒） */
+    fun reset(packageName: String) {
+        prefs.edit().remove(packageName).apply()
+    }
 }

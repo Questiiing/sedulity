@@ -91,17 +91,23 @@ object LimitManager {
         }
 
         LimitDiagnostics.log(context, "manager", "$packageName 超限($used 分钟)，安排 ${CONFIRM_DELAY_MS}ms 后二次确认")
-        scheduleConfirm(context, limit, used, now)
+        scheduleConfirm(context, limit, used, now, requireRootMatch = false)
     }
 
-    private fun scheduleConfirm(context: Context, limit: AppLimit, usedMinutes: Int, now: Long) {
+    private fun scheduleConfirm(
+        context: Context,
+        limit: AppLimit,
+        usedMinutes: Int,
+        now: Long,
+        requireRootMatch: Boolean
+    ) {
         pendingRunnable?.let { handler.removeCallbacks(it) }
         val pending = PendingConfirm(context.applicationContext, limit, usedMinutes, now)
         pendingConfirm = pending
         pendingRunnable = Runnable {
             pendingConfirm = null
             pendingRunnable = null
-            confirmAndBlock(pending)
+            confirmAndBlock(pending, 0, requireRootMatch)
         }
         handler.postDelayed(pendingRunnable!!, CONFIRM_DELAY_MS)
     }
@@ -113,20 +119,33 @@ object LimitManager {
         pendingConfirm = null
     }
 
-    /** 二次确认：此时当前活动窗口必须仍是目标应用，否则说明事件已过期/是失去焦点事件 */
-    private fun confirmAndBlock(pending: PendingConfirm, attempt: Int = 0) {
+    /**
+     * 二次确认：
+     * - 事件路径（requireRootMatch=false）：本机 rootInActiveWindow 常返回桌面/不可信，
+     *   因此只防"活动窗口是本应用自己"一种误判，其余直接信任新鲜事件，保证该弹就弹；
+     * - 兜底路径（requireRootMatch=true）：必须核对到目标应用才弹，避免把旧前台误当当前。
+     */
+    private fun confirmAndBlock(pending: PendingConfirm, attempt: Int, requireRootMatch: Boolean) {
         val pkg = pending.limit.packageName
         val context = pending.context
         val active = LimitWatchService.activeWindowPackage()
-        if (active != null && active != pkg) {
-            LimitDiagnostics.log(context, "manager", "确认失败：活动窗口=$active，目标=$pkg，放弃弹窗（事件可能已过期）")
-            return
-        }
-        if (active == null && attempt < MAX_CONFIRM_RETRIES) {
-            // 窗口可能还没就绪：再确认一次，仍读不到才按事件判定
-            LimitDiagnostics.log(context, "manager", "活动窗口暂不可读，${ROOT_RETRY_MS}ms 后再次确认")
-            handler.postDelayed({ confirmAndBlock(pending, attempt + 1) }, ROOT_RETRY_MS)
-            return
+        if (requireRootMatch) {
+            if (active != null && active != pkg) {
+                LimitDiagnostics.log(context, "manager", "兜底确认失败：活动窗口=$active，目标=$pkg，放弃弹窗")
+                return
+            }
+            if (active == null && attempt < MAX_CONFIRM_RETRIES) {
+                // 窗口可能还没就绪：再确认一次
+                LimitDiagnostics.log(context, "manager", "兜底确认：活动窗口暂不可读，${ROOT_RETRY_MS}ms 后重试")
+                handler.postDelayed({ confirmAndBlock(pending, attempt + 1, true) }, ROOT_RETRY_MS)
+                return
+            }
+        } else {
+            if (active == context.packageName) {
+                LimitDiagnostics.log(context, "manager", "确认时活动窗口是本应用自己，放弃弹窗")
+                return
+            }
+            LimitDiagnostics.log(context, "manager", "事件确认 root=$active（本机 root 不可信，仅记录）")
         }
         if (AppForeground.visible) {
             LimitDiagnostics.log(context, "manager", "确认时本应用界面正显示，放弃弹窗")
@@ -183,11 +202,8 @@ object LimitManager {
             LimitDiagnostics.log(context, "manager", "兜底检查：$pkg 已用 $used 分钟，未超 ${limit.maxMinutes}，跳过")
             return
         }
-        if (now - (lastNotifiedAt[pkg] ?: 0L) >= NOTIFY_COOLDOWN_MS) {
-            LimitDiagnostics.log(context, "manager", "兜底检查：$pkg 超限，补发通知")
-            NotificationHelper.showLimitExceeded(context, limit, used)
-            lastNotifiedAt[pkg] = now
-        }
+        LimitDiagnostics.log(context, "manager", "兜底检查：$pkg 超限，安排确认后弹拦截")
+        scheduleConfirm(context, limit, used, now, requireRootMatch = true)
     }
 
     fun setGrace(packageName: String, durationMs: Long) {

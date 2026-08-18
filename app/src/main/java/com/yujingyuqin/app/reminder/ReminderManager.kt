@@ -78,6 +78,8 @@ object ReminderManager {
                 cancelAlarms(context, task)
                 continue
             }
+            // 先清掉旧闹钟（含旧重复闹钟），再按最新设置重排
+            cancelAlarms(context, task)
             val next = ReminderLogic.nextReminderTime(Calendar.getInstance(), task)
             scheduleAlarm(context, task, next.timeInMillis, repeat = false)
         }

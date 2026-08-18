@@ -15,6 +15,7 @@ import com.yujingyuqin.app.reminder.ReminderManager
 import com.yujingyuqin.app.util.AppForeground
 import com.yujingyuqin.app.util.StatusBarInsets
 import java.util.Locale
+import com.yujingyuqin.app.data.ReminderStateStore
 
 class EditTaskActivity : AppCompatActivity() {
 
@@ -154,6 +155,8 @@ class EditTaskActivity : AppCompatActivity() {
             enabled = binding.switchEnabled.isChecked
         )
         TaskStore(this).upsert(updated)
+        // 重置今日提醒状态：改时间/目标后按新设置重新提醒，避免"已通知过就不再通知"
+        ReminderStateStore(this).reset(pkg)
         ReminderManager.rescheduleAll(this)
         ReminderManager.checkTask(this, updated)
         Toast.makeText(this, "已保存", Toast.LENGTH_SHORT).show()
@@ -163,6 +166,7 @@ class EditTaskActivity : AppCompatActivity() {
     private fun deleteTask() {
         val pkg = selectedPackage ?: return
         TaskStore(this).delete(pkg)
+        ReminderStateStore(this).reset(pkg)
         existingTask?.let { ReminderManager.cancelAlarms(this, it) }
         finish()
     }
